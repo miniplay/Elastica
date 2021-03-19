@@ -1,136 +1,106 @@
-#/bin/bash
-
-SOURCE = "./lib"
-TARGET?=56
-
-# By default docker environment is used to run commands. To run without the predefined environment, set RUN_ENV=" " either as parameter or as environment variable
-ifndef RUN_ENV
-	RUN_ENV = docker run -v $(shell pwd):/elastica ruflin/elastica
-endif
-
 .PHONY: clean
 clean:
-	rm -r -f ./build
-	rm -r -f ./vendor
-	rm -r -f ./composer.lock
+	rm -fr tools vendor build composer.lock .php_cs.cache
 
-# Runs commands inside virtual environemnt. Example usage inside docker: make run RUN="make phpunit"
-.PHONY: run
-run:
-	docker run -v $(shell pwd):/elastica ruflin/elastica $(RUN)
+tools/phive.phar:
+	mkdir tools; \
+	wget --no-clobber --output-document=tools/phive.phar "https://phar.io/releases/phive.phar" --quiet; \
+    wget --no-clobber --output-document=tools/phive.phar.asc "https://phar.io/releases/phive.phar.asc" --quiet; \
+    gpg --keyserver hkps.pool.sks-keyservers.net --recv-keys 0x9D8A98B29B2D5D79; \
+    gpg --verify tools/phive.phar.asc tools/phive.phar; \
+    rm tools/phive.phar.asc; \
+    chmod +x tools/phive.phar;
 
+vendor/autoload.php:
+	# Installing Symfony Flex: parallel download of dependency libs
+	composer global require --no-progress --no-scripts --no-plugins symfony/flex
+	composer install --prefer-dist --no-interaction ${COMPOSER_FLAGS}
 
-### Quality checks / development tools ###
-.PHONY: code-browser
-code-browser:
-	${RUN_ENV} phpcb --log ./build/logs --source ${SOURCE} --output ./build/code-browser
+tools/php-cs-fixer.phar: tools/phive.phar
+	tools/phive.phar install --copy --trust-gpg-keys 0xE82B2FB314E9906E,0x4AA394086372C20A
 
-# Copy paste detector
-.PHONY: cpd
-cpd:
-	${RUN_ENV} phpcpd --log-pmd ./build/logs/pmd-cpd.xml ${SOURCE}
+.PHONY: install-phpcs
+install-phpcs: tools/php-cs-fixer.phar
 
-.PHONY: messdetector
-messdetector:
-	${RUN_ENV} phpmd ${SOURCE} text codesize,unusedcode,naming,design ./build/phpmd.xml
+.PHONY: composer-install
+composer-install: vendor/autoload.php
 
-.PHONY: messdetector-ci
-messdetector-ci:
-	${RUN_ENV} phpmd ${SOURCE} xml codesize,unusedcode,naming,design --reportfile ./build/logs/pmd.xml
+.PHONY: composer-update
+composer-update:
+	composer update --prefer-dist --no-interaction ${COMPOSER_FLAGS}
 
-.PHONY: dependencies
-dependencies:
-	${RUN_ENV} pdepend --jdepend-xml=./build/logs/jdepend.xml \
-		--jdepend-chart=./build/pdepend/dependencies.svg \
-		--overview-pyramid=./build/pdepend/overview-pyramid.svg \
-		${SOURCE}
+.PHONY: install-tools
+install-tools: install-phpcs
 
-.PHONY: phpunit
-phpunit:
-	phpunit -c test/ --coverage-clover build/coverage/unit-coverage.xml --group unit
-	phpunit -c test/ --coverage-clover build/coverage/functional-coverage.xml --group functional
-	phpunit -c test/ --coverage-clover build/coverage/shutdown-coverage.xml --group shutdown
+.PHONY: run-phpcs
+run-phpcs: composer-install install-phpcs
+	tools/php-cs-fixer.phar fix --dry-run --allow-risky=yes -v
 
-.PHONY: tests
-tests:
-	# Rebuild image to copy changes files to the image
-	make elastica-image
-	make setup
-	mkdir -p build
-	docker-compose run elastica make phpunit
-	docker cp elastica_elastica_run_1:/elastica/build/coverage/ $(shell pwd)/build/coverage
+.PHONY: fix-phpcs
+fix-phpcs: composer-install install-phpcs
+	tools/php-cs-fixer.phar fix --allow-risky=yes -v
 
-# Makes it easy to run a single test file. Example to run IndexTest.php: make test TEST="IndexTest.php"
-.PHONY: test
-test:
-	make elastica-image
-	make setup
-	docker-compose run elastica phpunit -c test/ ${TEST}
+.PHONY: run-phpunit
+run-phpunit: composer-install
+	vendor/bin/phpunit ${PHPUNIT_OPTIONS}
 
-.PHONY: doc
-doc:
-	${RUN_ENV} phpdoc run -d lib/ -t build/docs
+.PHONY: run-phpunit-coverage
+run-phpunit-coverage: composer-install
+	EXIT_STATUS=0 ; \
+	vendor/bin/phpunit --coverage-clover build/coverage/unit-coverage.xml --group unit || EXIT_STATUS=$$? ; \
+	vendor/bin/phpunit --coverage-clover build/coverage/functional-coverage.xml --group functional || EXIT_STATUS=$$? ; \
+	exit $$EXIT_STATUS
 
-# Uses the preconfigured standards in .php_cs
-.PHONY: lint
-lint:
-	${RUN_ENV} php-cs-fixer fix
+.PHONY: run-coveralls
+run-coveralls:
+	tools/php-coveralls.phar -v
 
-.PHONY: loc
-loc:
-	${RUN_ENV} cloc --by-file --xml --exclude-dir=build -out=build/cloc.xml .
+tools/phpdocumentor.phar:
+	curl https://gitreleases.dev/gh/phpDocumentor/phpDocumentor/latest/phpDocumentor.phar -o tools/phpdocumentor.phar --silent -L; \
+	chmod +x tools/phpdocumentor.phar
 
-.PHONY: phploc
-phploc:
-	${RUN_ENV} phploc --log-csv ./build/logs/phploc.csv ${SOURCE}
+.PHONY: run-phpdoc
+run-phpdoc: tools/phpdocumentor.phar
+	tools/phpdocumentor.phar --directory=lib --target=build/docs --template=clean
 
+##
+## Docker commands
+##
 
-# VIRTUAL ENVIRONMENT
-.PHONY: build
-build:
-	docker-compose build
+.PHONY: docker-start
+docker-start:
+	docker-compose --file=docker/docker-compose.yml \
+		--file=docker/docker-compose.proxy.yml \
+		--file=docker/docker-compose.es.yml \
+		--file=docker/docker-compose.es.yml \
+		up ${DOCKER_OPTIONS}
 
-.PHONY: setup
-setup: build
-	docker-compose scale elasticsearch=3
-	# TODO: Makes the snapshot directory writable for all instances. Nicer solution needed.
-	docker-compose run elasticsearch chmod -R 777 /tmp/backups/
+.PHONY: docker-stop
+docker-stop:
+	docker-compose --file=docker/docker-compose.yml \
+		--file=docker/docker-compose.proxy.yml \
+		--file=docker/docker-compose.es.yml \
+	    down
 
-.PHONY: start
-start:
-	docker-compose up
+.PHONY: docker-run-phpunit
+docker-run-phpunit:
+	docker exec -ti 'elastica_php' env TERM=xterm-256color make run-phpunit PHPUNIT_OPTIONS=${PHPUNIT_OPTIONS}
 
-.PHONY: stop
-stop:
-	docker-compose stop
+.PHONY: docker-run-phpcs
+docker-run-phpcs:
+	docker exec -ti 'elastica_php' env TERM=xterm-256color make run-phpcs
 
-.PHONY: destroy
-destroy: clean
-	docker-compose kill
-	docker-compose rm
+.PHONY: docker-fix-phpcs
+docker-fix-phpcs:
+	docker exec -ti 'elastica_php' env TERM=xterm-256color make fix-phpcs
 
-# Stops and removes all containers and removes all images
-.PHONY: destroy-environment
-destroy-environment:
-	make remove-containers
-	-docker rmi $(shell docker images -q)
+.PHONY: docker-shell
+docker-shell:
+	docker exec -ti 'elastica_php' sh
 
-.PHONY: remove-containers
-remove-containers:
-	-docker stop $(shell docker ps -a -q)
-	-docker rm -v $(shell docker ps -a -q)
+## Additional commands
 
-# Starts a shell inside the elastica image
-.PHONY: shell
-shell:
-	docker run -v $(shell pwd):/elastica -ti ruflin/elastica /bin/bash
-
-# Starts a shell inside the elastica image with the full environment running
-.PHONY: env-shell
-env-shell:
-	docker-compose run elastica /bin/bash
-
-# Visualise repo
+# Visualise repo, requires `gource`
 .PHONY: gource
 gource:
 	gource --log-format git \
@@ -138,43 +108,3 @@ gource:
 		--title 'Elastica (https://github.com/ruflin/Elastica)' \
 		--user-scale 1 \
 		--max-user-speed 50
-
-## DOCKER IMAGES
-
-.PHONY: elastica-image
-elastica-image:
-	docker build -t ruflin/elastica-dev-base -f env/elastica/Docker${TARGET} env/elastica/
-	docker build -t ruflin/elastica .
-
-# Builds all image locally. This can be used to use local images if changes are made locally to the Dockerfiles
-.PHONY: build-images
-build-images:
-	docker build -t ruflin/elastica-dev-base -f env/elastica/Docker${TARGET} env/elastica/
-	docker build -t ruflin/elasticsearch-elastica env/elasticsearch/
-	docker build -t ruflin/nginx-elastica env/nginx/
-	docker build -t ruflin/elastica-data env/data/
-	make elastica-image
-
-# Removes all local images
-.PHONY: clean-images
-clean-images:
-	-docker rmi ruflin/elastica-dev-base
-	-docker rmi ruflin/elasticsearch-elastica
-	-docker rmi ruflin/nginx-elastica
-	-docker rmi ruflin/elastica
-	-docker rmi ruflin/elastica-data
-
-# Pushs images as latest to the docker registry. This is normally not needed as they are directly fetched and built from Github
-.PHONY: push-images
-push-images: build-images
-	docker push ruflin/elastica-dev-base
-	docker push ruflin/elasticsearch-elastica
-	docker push ruflin/nginx-elastica
-	docker push ruflin/elastica
-
-
-## OTHER
-
-# google-setup:
-# 	docker-machine create --driver google --google-project elastica-1024 --google-machine-type n1-standard-8 elastica
-# 	eval "$(docker-machine env elastica)"
